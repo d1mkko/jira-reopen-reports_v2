@@ -12,10 +12,11 @@ jobs:
   export:
     runs-on: ubuntu-latest
     env:
-      JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
-      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      # map secrets to the env names the script expects
+      JIRA_BASE_URL: ${{ secrets.JIRA_URL }}          # <-- your secret is JIRA_URL
+      JIRA_EMAIL:     ${{ secrets.JIRA_EMAIL }}
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-      MONTH: ${{ inputs.month }}
+      MONTH:          ${{ inputs.month }}
 
     steps:
       - name: Checkout repo
