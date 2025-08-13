@@ -1,0 +1,39 @@
+name: Run Reopen Reports (smoke)
+
+on:
+  workflow_dispatch:
+    inputs:
+      month:
+        description: "Month to process (YYYY-MM), e.g. 2025-08"
+        required: true
+        type: string
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Validate month format
+        run: |
+          MONTH="${{ inputs.month }}"
+          if ! echo "$MONTH" | grep -Eq '^[0-9]{4}-[0-9]{2}$'; then
+            echo "::error::Bad month format. Use YYYY-MM (e.g., 2025-08)"
+            exit 1
+          fi
+          echo "Month OK: $MONTH"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Python smoke
+        run: |
+          python - <<'PY'
+          import re
+          m = "${{ inputs.month }}"
+          assert re.match(r"^\d{4}-\d{2}$", m), "bad month"
+          print("Python OK. Month:", m)
+          PY
