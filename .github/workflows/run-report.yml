@@ -1,4 +1,4 @@
-name: Run Reopen Reports (export)
+name: Run Reopen Reports (export + python)
 
 on:
   workflow_dispatch:
@@ -9,11 +9,11 @@ on:
         type: string
 
 jobs:
-  export:
+  build:
     runs-on: ubuntu-latest
     env:
-      # Map your existing secrets to the env names the script expects
-      JIRA_BASE_URL: ${{ secrets.JIRA_URL }}        # you created JIRA_URL
+      # map your secrets
+      JIRA_BASE_URL: ${{ secrets.JIRA_URL }}
       JIRA_EMAIL:     ${{ secrets.JIRA_EMAIL }}
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
       MONTH:          ${{ inputs.month }}
@@ -25,9 +25,7 @@ jobs:
       - name: Validate month
         run: |
           if ! echo "$MONTH" | grep -Eq '^[0-9]{4}-[0-9]{2}$'; then
-            echo "::error::Bad month format. Use YYYY-MM (e.g., 2025-08)"
-            exit 1
-          fi
+            echo "::error::Bad month format. Use YYYY-MM"; exit 1; fi
           echo "Month OK: $MONTH"
 
       - name: Setup Python
@@ -35,40 +33,69 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Install base deps
         run: |
           python -m pip install --upgrade pip
           pip install requests
+
+      - name: Install report deps (optional)
+        run: |
+          if [ -f scripts/requirements.txt ]; then
+            pip install -r scripts/requirements.txt
+          else
+            echo "No scripts/requirements.txt found; skipping"
+          fi
 
       - name: Build Jira export
         run: |
           python scripts/export_jira.py --month "$MONTH" --out export.csv
 
-      - name: Show files & CSV preview
+      - name: Preview export
         run: |
-          echo "Workspace: $GITHUB_WORKSPACE"
-          ls -lah
           echo "---- export.csv (first 10 lines) ----"
           head -n 10 export.csv || true
           echo "---- line count ----"
           wc -l export.csv || true
 
-      - name: Upload export.csv as artifact
-        id: upload
+      - name: Run Python report generator
+        run: |
+          python scripts/run_reports_wrapper.py export.csv
+
+      # upload all three files
+      - name: Upload export.csv
+        id: up_export
         uses: actions/upload-artifact@v4
         with:
           name: jira-export-${{ env.MONTH }}
           path: export.csv
           if-no-files-found: error
 
-      - name: Add summary with direct link
+      - name: Upload report: by user
+        id: up_user
+        uses: actions/upload-artifact@v4
+        with:
+          name: reopen-report-by-user-${{ env.MONTH }}
+          path: reports/reopens_by_user.csv
+          if-no-files-found: error
+
+      - name: Upload report: by ticket
+        id: up_ticket
+        uses: actions/upload-artifact@v4
+        with:
+          name: reopen-report-by-ticket-${{ env.MONTH }}
+          path: reports/reopens_by_ticket.csv
+          if-no-files-found: error
+
+      - name: Add summary with links
         run: |
           {
-            echo "## ✅ Export is ready"
+            echo "## ✅ Reports ready"
             echo ""
-            echo "- **Month:** \`${MONTH}\`"
-            echo "- **Artifact name:** \`jira-export-${MONTH}\`"
-            echo "- **Download:** https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts/${{ steps.upload.outputs.artifact-id }}"
+            echo "**Month:** \`${MONTH}\`"
             echo ""
-            echo "_Tip: The download is also listed at the bottom of this run under **Artifacts**._"
+            echo "- Export:   https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts/${{ steps.up_export.outputs.artifact-id }}"
+            echo "- By user:  https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts/${{ steps.up_user.outputs.artifact-id }}"
+            echo "- By ticket:https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts/${{ steps.up_ticket.outputs.artifact-id }}"
+            echo ""
+            echo "_Or download from the **Artifacts** section at the bottom of this run._"
           } >> "$GITHUB_STEP_SUMMARY"
