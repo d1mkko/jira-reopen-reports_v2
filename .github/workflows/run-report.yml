@@ -1,27 +1,30 @@
-name: Run Reopen Reports (smoke)
+name: Run Reopen Reports (export)
 
 on:
   workflow_dispatch:
     inputs:
       month:
-        description: "Month to process (YYYY-MM), e.g. 2025-08"
+        description: "Month YYYY-MM (e.g., 2025-08)"
         required: true
         type: string
 
 jobs:
-  smoke:
+  export:
     runs-on: ubuntu-latest
+    env:
+      JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      MONTH: ${{ inputs.month }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Validate month format
+      - name: Validate month
         run: |
-          MONTH="${{ inputs.month }}"
           if ! echo "$MONTH" | grep -Eq '^[0-9]{4}-[0-9]{2}$'; then
-            echo "::error::Bad month format. Use YYYY-MM (e.g., 2025-08)"
-            exit 1
-          fi
+            echo "::error::Bad month format. Use YYYY-MM"; exit 1; fi
           echo "Month OK: $MONTH"
 
       - name: Setup Python
@@ -29,11 +32,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Python smoke
+      - name: Install deps
         run: |
-          python - <<'PY'
-          import re
-          m = "${{ inputs.month }}"
-          assert re.match(r"^\d{4}-\d{2}$", m), "bad month"
-          print("Python OK. Month:", m)
-          PY
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Build Jira export
+        run: python scripts/export_jira.py --month "$MONTH" --out export.csv
+
+      - name: Upload export.csv
+        uses: actions/upload-artifact@v4
+        with:
+          name: jira-export-${{ inputs.month }}
+          path: export.csv
