@@ -8,28 +8,30 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: write   # <-- needed to push files
-
 jobs:
   export:
     runs-on: ubuntu-latest
     env:
-      JIRA_BASE_URL: ${{ secrets.JIRA_URL }}      # your secret name
+      # Map your existing secrets to the env names the script expects
+      JIRA_BASE_URL: ${{ secrets.JIRA_URL }}        # you created JIRA_URL
       JIRA_EMAIL:     ${{ secrets.JIRA_EMAIL }}
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
       MONTH:          ${{ inputs.month }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Validate month
         run: |
           if ! echo "$MONTH" | grep -Eq '^[0-9]{4}-[0-9]{2}$'; then
-            echo "::error::Bad month format. Use YYYY-MM"; exit 1; fi
+            echo "::error::Bad month format. Use YYYY-MM (e.g., 2025-08)"
+            exit 1
+          fi
           echo "Month OK: $MONTH"
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -39,15 +41,34 @@ jobs:
           pip install requests
 
       - name: Build Jira export
-        run: python scripts/export_jira.py --month "$MONTH" --out export.csv
-
-      - name: Save export into repo folder
         run: |
-          mkdir -p exports/"$MONTH"
-          mv -f export.csv exports/"$MONTH"/export.csv
+          python scripts/export_jira.py --month "$MONTH" --out export.csv
 
-      - name: Commit & push export
-        uses: EndBug/add-and-commit@v9
+      - name: Show files & CSV preview
+        run: |
+          echo "Workspace: $GITHUB_WORKSPACE"
+          ls -lah
+          echo "---- export.csv (first 10 lines) ----"
+          head -n 10 export.csv || true
+          echo "---- line count ----"
+          wc -l export.csv || true
+
+      - name: Upload export.csv as artifact
+        id: upload
+        uses: actions/upload-artifact@v4
         with:
-          add: 'exports'
-          message: "chore(reports): add export for ${{ inputs.month }}"
+          name: jira-export-${{ env.MONTH }}
+          path: export.csv
+          if-no-files-found: error
+
+      - name: Add summary with direct link
+        run: |
+          {
+            echo "## ✅ Export is ready"
+            echo ""
+            echo "- **Month:** \`${MONTH}\`"
+            echo "- **Artifact name:** \`jira-export-${MONTH}\`"
+            echo "- **Download:** https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts/${{ steps.upload.outputs.artifact-id }}"
+            echo ""
+            echo "_Tip: The download is also listed at the bottom of this run under **Artifacts**._"
+          } >> "$GITHUB_STEP_SUMMARY"
