@@ -40,6 +40,39 @@ for index, row in df.iterrows():
             'Date': pd.to_datetime(date_str)
         })
 
+
+def process(input_csv_path, out_user_csv_path, out_ticket_csv_path):
+    """
+    Reads the exported Jira CSV (input_csv_path),
+    generates the two required reports,
+    and writes them to out_user_csv_path and out_ticket_csv_path.
+    """
+
+    import pandas as pd
+
+    # Read Jira export
+    df = pd.read_csv(input_csv_path)
+
+    # --- Example logic ---
+    # Adjust these to your real aggregation logic
+    by_user = (
+        df.groupby("Assignee")
+        .size()
+        .reset_index(name="Reopen Count")
+        .sort_values("Reopen Count", ascending=False)
+    )
+    by_user.to_csv(out_user_csv_path, index=False)
+
+    by_ticket = (
+        df.groupby(["Issue key", "Summary"])
+        .size()
+        .reset_index(name="Reopen Count")
+        .sort_values("Reopen Count", ascending=False)
+    )
+    by_ticket.to_csv(out_ticket_csv_path, index=False)
+
+    print(f"Reports written:\n  {out_user_csv_path}\n  {out_ticket_csv_path}")
+
 # Create a new DataFrame from the collected reopen events
 reopens_df = pd.DataFrame(reopen_data)
 
