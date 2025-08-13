@@ -8,19 +8,20 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: write   # <-- needed to push files
+
 jobs:
   export:
     runs-on: ubuntu-latest
     env:
-      # map secrets to the env names the script expects
-      JIRA_BASE_URL: ${{ secrets.JIRA_URL }}          # <-- your secret is JIRA_URL
+      JIRA_BASE_URL: ${{ secrets.JIRA_URL }}      # your secret name
       JIRA_EMAIL:     ${{ secrets.JIRA_EMAIL }}
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
       MONTH:          ${{ inputs.month }}
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Validate month
         run: |
@@ -28,8 +29,7 @@ jobs:
             echo "::error::Bad month format. Use YYYY-MM"; exit 1; fi
           echo "Month OK: $MONTH"
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -41,8 +41,13 @@ jobs:
       - name: Build Jira export
         run: python scripts/export_jira.py --month "$MONTH" --out export.csv
 
-      - name: Upload export.csv
-        uses: actions/upload-artifact@v4
+      - name: Save export into repo folder
+        run: |
+          mkdir -p exports/"$MONTH"
+          mv -f export.csv exports/"$MONTH"/export.csv
+
+      - name: Commit & push export
+        uses: EndBug/add-and-commit@v9
         with:
-          name: jira-export-${{ inputs.month }}
-          path: export.csv
+          add: 'exports'
+          message: "chore(reports): add export for ${{ inputs.month }}"
