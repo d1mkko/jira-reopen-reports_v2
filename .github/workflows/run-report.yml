@@ -33,18 +33,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install base deps
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests
-
-      - name: Install report deps (optional)
-        run: |
-          if [ -f scripts/requirements.txt ]; then
-            pip install -r scripts/requirements.txt
-          else
-            echo "No scripts/requirements.txt found; skipping"
-          fi
+          pip install requests pandas
 
       - name: Build Jira export
         run: |
@@ -61,7 +53,6 @@ jobs:
         run: |
           python scripts/run_reports_wrapper.py export.csv
 
-      # upload all three files
       - name: Upload export.csv
         id: up_export
         uses: actions/upload-artifact@v4
@@ -70,7 +61,7 @@ jobs:
           path: export.csv
           if-no-files-found: error
 
-      - name: Upload report: by user
+      - name: "Upload report - by user"
         id: up_user
         uses: actions/upload-artifact@v4
         with:
@@ -78,7 +69,7 @@ jobs:
           path: reports/reopens_by_user.csv
           if-no-files-found: error
 
-      - name: Upload report: by ticket
+      - name: "Upload report - by ticket"
         id: up_ticket
         uses: actions/upload-artifact@v4
         with:
