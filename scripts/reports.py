@@ -1,105 +1,79 @@
-import pandas as pd
-from io import StringIO
+import os
 import re
+import pandas as pd
 
-# --- USER CONFIGURATION ---
-# Define the month for which you need the report in 'YYYY-MM' format.
-REPORT_MONTH = '2025-09'
+DATE_RE = re.compile(r'(\d{4}-\d{2}-\d{2})')  # capture YYYY-MM-DD
+ASSIGNEE_RE = re.compile(r'Assignee:\s*(.*?)(?:\n|$)')  # capture name after 'Assignee:'
 
-# You will need to replace 'your_jira_export.csv' with the actual
-# name of your file.
-try:
-    df = pd.read_csv('Jira.csv')
-except FileNotFoundError:
-    print("Error: The file 'Jira.csv' was not found.")
-    print("Please make sure the file is in the same directory as this script.")
-    exit()
+def _extract_reopen_events(row):
+    """
+    From one export row, parse the 'Custom field (Reopen log )' text and yield
+    (issue_key, summary, assignee_name, date_str) tuples.
+    """
+    issue_key = row.get('Issue key', '')
+    summary = row.get('Summary', '')
+    text = str(row.get('Custom field (Reopen log )', '') or '')
 
-# The 'Reopen log' column might contain NaN values or be empty, so we fill them
-# with an empty string to avoid errors during string processing.
-df['Custom field (Reopen log )'] = df['Custom field (Reopen log )'].fillna('')
-
-# --- 1. Calculate Reopens Per Assignee for the specified month ---
-# This section calculates the number of reopens that occurred for each assignee
-# within the month defined by REPORT_MONTH.
-
-# Initialize a list to store the reopen events
-reopen_data = []
-
-# Iterate through each row of the DataFrame
-for index, row in df.iterrows():
-    # Use a regular expression to find all log entries within the cell.
-    for match in re.finditer(r'(\d{4}-\d{2}-\d{2}).*?Assignee: (.*?)(\n|$)', row['Custom field (Reopen log )']):
-        date_str = match.group(1)
-        assignee_name = match.group(2).strip()
-        
-        # Append the extracted issue key, assignee, and date to our list
-        reopen_data.append({
-            'Issue key': row['Issue key'],
-            'Assignee': assignee_name,
-            'Date': pd.to_datetime(date_str)
-        })
-
+    events = []
+    # We assume each date belongs to the following 'Assignee: ...' on the same/next line.
+    # We'll scan by lines for robustness.
+    for block in text.splitlines():
+        dmatch = DATE_RE.search(block)
+        if not dmatch:
+            continue
+        date_str = dmatch.group(1)
+        amatch = ASSIGNEE_RE.search(block)
+        assignee_name = (amatch.group(1).strip() if amatch else (row.get('Assignee', '') or ''))
+        events.append((issue_key, summary, assignee_name, date_str))
+    return events
 
 def process(input_csv_path, out_user_csv_path, out_ticket_csv_path):
     """
-    Reads the exported Jira CSV (input_csv_path),
-    generates the two required reports,
-    and writes them to out_user_csv_path and out_ticket_csv_path.
+    Read export.csv, parse Reopen log lines, filter by env MONTH (YYYY-MM),
+    and write:
+      - reopens_by_user.csv (Assignee, Reopens Count)
+      - reopens_by_ticket.csv (Issue key, Summary, Reopens Count)
     """
+    month = os.environ.get("MONTH", "").strip()
+    if not month or not re.match(r'^\d{4}-\d{2}$', month):
+        raise ValueError("MONTH env var must be set to YYYY-MM (provided by workflow).")
 
-    import pandas as pd
-
-    # Read Jira export
     df = pd.read_csv(input_csv_path)
+    if 'Custom field (Reopen log )' not in df.columns:
+        raise ValueError("Expected column 'Custom field (Reopen log )' not found in export.")
 
-    # --- Example logic ---
-    # Adjust these to your real aggregation logic
+    df['Custom field (Reopen log )'] = df['Custom field (Reopen log )'].fillna('')
+    df['Assignee'] = df.get('Assignee', '').fillna('')
+
+    # Collect reopen events (Issue key, Summary, Assignee, Date)
+    all_events = []
+    for _, row in df.iterrows():
+        all_events.extend(_extract_reopen_events(row))
+
+    if not all_events:
+        # no events; write empty reports with headers
+        pd.DataFrame(columns=['Assignee', 'Reopens Count']).to_csv(out_user_csv_path, index=False)
+        pd.DataFrame(columns=['Issue key', 'Summary', 'Reopens Count']).to_csv(out_ticket_csv_path, index=False)
+        return
+
+    events_df = pd.DataFrame(all_events, columns=['Issue key', 'Summary', 'Assignee', 'Date'])
+    # Filter to target month
+    events_df['Date'] = pd.to_datetime(events_df['Date'], errors='coerce')
+    events_df['Month'] = events_df['Date'].dt.to_period('M').astype(str)
+    events_df = events_df[events_df['Month'] == month]
+
+    # By user
     by_user = (
-        df.groupby("Assignee")
-        .size()
-        .reset_index(name="Reopen Count")
-        .sort_values("Reopen Count", ascending=False)
+        events_df.groupby('Assignee')
+        .size().reset_index(name='Reopens Count')
+        .sort_values('Reopens Count', ascending=False)
     )
     by_user.to_csv(out_user_csv_path, index=False)
 
+    # By ticket (count of events per Issue key)
     by_ticket = (
-        df.groupby(["Issue key", "Summary"])
-        .size()
-        .reset_index(name="Reopen Count")
-        .sort_values("Reopen Count", ascending=False)
+        events_df.groupby(['Issue key', 'Summary'])
+        .size().reset_index(name='Reopens Count')
+        .sort_values(['Reopens Count','Issue key'], ascending=[False, True])
     )
     by_ticket.to_csv(out_ticket_csv_path, index=False)
-
-    print(f"Reports written:\n  {out_user_csv_path}\n  {out_ticket_csv_path}")
-
-# Create a new DataFrame from the collected reopen events
-reopens_df = pd.DataFrame(reopen_data)
-
-# Extract the month from the 'Date' column and format it as a period ('YYYY-MM')
-reopens_df['Month'] = reopens_df['Date'].dt.to_period('M')
-
-# Filter the DataFrame to include only reopen events from the specified month.
-filtered_reopens = reopens_df[reopens_df['Month'] == REPORT_MONTH]
-
-# Group by 'Assignee' and count the occurrences for the filtered month.
-reopens_per_assignee = filtered_reopens.groupby(['Assignee']).size().reset_index(name='Reopens Count')
-
-# Save the result to a new CSV file
-output_filename_monthly = f'reopens_per_assignee_{REPORT_MONTH}.csv'
-reopens_per_assignee.to_csv(output_filename_monthly, index=False)
-print(f"Reopen stats for '{REPORT_MONTH}' have been saved to '{output_filename_monthly}'")
-
-
-# --- 2. Calculate Reopens Per Ticket for the specified month ---
-# This section calculates the number of reopens per ticket that occurred
-# in the month defined by REPORT_MONTH.
-
-# Group the filtered reopen data by 'Issue key' and 'Assignee' and count
-# the number of reopen events for each ticket.
-reopens_per_ticket = filtered_reopens.groupby(['Issue key', 'Assignee']).size().reset_index(name='Reopens Count')
-
-# Save the per-ticket result to a new CSV file
-output_filename_ticket = f'reopens_per_ticket_{REPORT_MONTH}.csv'
-reopens_per_ticket.to_csv(output_filename_ticket, index=False)
-print(f"Per-ticket reopen stats for '{REPORT_MONTH}' have been saved to '{output_filename_ticket}'")
