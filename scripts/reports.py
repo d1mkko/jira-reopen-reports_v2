@@ -74,13 +74,13 @@ def process(input_csv_path, out_user_csv_path, out_ticket_csv_path):
     # By ticket + assignee (count events per Issue key & Assignee)
     by_ticket = (
         events_df
-        .groupby(['Issue key', 'Summary', 'Assignee'])
+        .groupby(['Issue key', 'Issue Type', 'Summary', 'Assignee'])
         .size()
         .reset_index(name='Reopens Count')
         .sort_values(['Assignee', 'Issue key'], ascending=[True, True])
     )
 
     # Reorder columns exactly as required
-    by_ticket = by_ticket[['Issue key', 'Summary', 'Reopens Count', 'Assignee']]
+    by_ticket = by_ticket[['Issue key', 'Issue Type', 'Summary', 'Reopens Count', 'Assignee']]
 
     by_ticket.to_csv(out_ticket_csv_path, index=False)
