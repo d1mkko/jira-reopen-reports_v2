@@ -80,7 +80,7 @@ def process(input_csv_path, out_user_csv_path, out_ticket_csv_path):
         .sort_values(['Assignee', 'Issue key'], ascending=[True, True])
     )
 
-    # Reorder columns exactly as required
+    # Reorder columns
     by_ticket = by_ticket[['Issue key', 'Issue Type', 'Summary', 'Reopens Count', 'Assignee']]
 
     by_ticket.to_csv(out_ticket_csv_path, index=False)
