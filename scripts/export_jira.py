@@ -118,78 +118,62 @@ def resolve_cf_id(base_url, auth_header, wanted_name, wanted_id=None, all_fields
     debug = "not found. Reopen-like fields:\n  - " + "\n  - ".join(candidates) if candidates else "not found. No 'reopen' fields visible."
     return None, debug
 
-def search_jql_paginated(base_url, auth_header, jql, fields):
+def iter_issues_search_jql(base_url, auth_header, jql, fields, path):
     """
-    Try POST /rest/api/3/search/jql first (your tenant supports this),
-    then POST /rest/api/3/jql/search as a fallback.
-
-    Yields issues across pages using nextPageToken / isLast.
+    Generator over issues for POST /rest/api/3/search/jql or /rest/api/3/jql/search.
+    Raises RuntimeError on HTTP failure.
     """
     headers = _auth_headers(auth_header)
-    primary = f"{base_url}/rest/api/3/search/jql"
-    fallback = f"{base_url}/rest/api/3/jql/search"
+    url = f"{base_url}{path}"
+    next_token = None
+    page_num = 0
 
-    def _pager(url):
-        next_token = None
-        while True:
-            body = {
-                "jql": jql,
-                "maxResults": 100,
-                "fields": fields
-            }
-            if next_token:
-                body["nextPageToken"] = next_token
-
-            r = requests.post(url, json=body, headers=headers, timeout=90)
-            if not r.ok:
-                return None, f"{r.status_code} {r.text[:300]}"
-            data = r.json() or {}
-            issues = data.get("issues", [])
-            for it in issues:
-                yield it
-            is_last = data.get("isLast", True)
-            if is_last:
-                return True, None
-            next_token = data.get("nextPageToken")
-            if not next_token:
-                return True, None
-
-    # Primary
-    print("[export] trying /rest/api/3/search/jql")
-    done, err = None, None
-    gen = _pager(primary)
-    try:
-        for issue in gen:
+    while True:
+        body = {"jql": jql, "maxResults": 100, "fields": fields}
+        if next_token:
+            body["nextPageToken"] = next_token
+        r = requests.post(url, json=body, headers=headers, timeout=90)
+        if not r.ok:
+            raise RuntimeError(f"{path} {r.status_code} {r.text[:300]}")
+        data = r.json() or {}
+        issues = data.get("issues", [])
+        for issue in issues:
             yield issue
-        done, err = gen  # try to read completion info
-    except TypeError:
-        # generator finished; assume success
-        done = True
-    except Exception as e:
-        err = f"exception {type(e).__name__}: {e}"
+        page_num += 1
+        is_last = data.get("isLast", True)
+        if is_last:
+            break
+        next_token = data.get("nextPageToken")
+        if not next_token:
+            break
 
-    if done:
-        print("[export] search OK via /rest/api/3/search/jql")
-        return
+def search_jql_with_fallback(base_url, auth_header, jql, fields):
+    """
+    Try /rest/api/3/search/jql first, then /rest/api/3/jql/search.
+    Yields issues. If both fail, raises SystemExit with a combined message.
+    """
+    candidates = ["/rest/api/3/search/jql", "/rest/api/3/jql/search"]
+    errors = []
 
-    print(f"[export] /search/jql failed; {err or 'unknown error'}, trying /jql/search…")
+    for path in candidates:
+        print(f"[export] trying {path}")
+        try:
+            any_yielded = False
+            for issue in iter_issues_search_jql(base_url, auth_header, jql, fields, path):
+                any_yielded = True
+                yield issue
+            print(f"[export] search OK via {path}")
+            # Even if no issues, the path worked — return gracefully.
+            return
+        except RuntimeError as e:
+            errors.append(f"{path}: {e}")
+            print(f"[export] {path} failed; {e}")
 
-    # Fallback
-    done, err = None, None
-    gen = _pager(fallback)
-    try:
-        for issue in gen:
-            yield issue
-        done, err = gen
-    except TypeError:
-        done = True
-    except Exception as e:
-        err = f"exception {type(e).__name__}: {e}"
-
-    if not done:
-        print(f"Jira search failed on both /search/jql and /jql/search. {err or ''}", file=sys.stderr)
-        sys.exit(1)
-    print("[export] search OK via /rest/api/3/jql/search")
+    # If we reach here, both candidates failed
+    print("Jira search failed on both /search/jql and /jql/search.", file=sys.stderr)
+    for err in errors[:5]:
+        print("  - " + err, file=sys.stderr)
+    sys.exit(1)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -235,7 +219,7 @@ def main():
     fields = ["issuetype", "key", "id", "summary", "assignee", cf_reopen_count, cf_reopen_log]
 
     rows = []
-    for issue in search_jql_paginated(base_url, auth_b64, jql, fields):
+    for issue in search_jql_with_fallback(base_url, auth_b64, jql, fields):
         f = issue.get("fields") or {}
         iss_type = (f.get("issuetype") or {}).get("name", "") or ""
         assignee = f.get("assignee") or {}
