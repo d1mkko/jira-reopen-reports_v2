@@ -113,45 +113,77 @@ def resolve_cf_id(base_url, auth_header, wanted_name, wanted_id=None, all_fields
     debug = "not found. Reopen-like fields:\n  - " + "\n  - ".join(candidates) if candidates else "not found. No 'reopen' fields visible."
     return None, debug
 
-def jira_search(base_url, auth_header, jql, start_at, fields):
+def jira_search_any(base_url, auth_header, jql, start_at, fields):
     """
-    Try multiple endpoints. Only fail after all candidates fail.
+    Try enhanced batch endpoint first (/jql/search), then legacy ones.
+    Returns a dict with keys: issues, startAt, maxResults, total
     """
     headers = _auth_headers(auth_header)
-    payload = {
+
+    # Candidate 1: Enhanced JQL batch search
+    # POST /rest/api/3/jql/search
+    # body: { "queries":[ { "jql": "...", "startAt":..., "maxResults":..., "fieldsByKeys": true, "fields":[...] } ] }
+    url1 = f"{base_url}/rest/api/3/jql/search"
+    payload1 = {
+        "queries": [{
+            "jql": jql,
+            "startAt": start_at,
+            "maxResults": 100,
+            "fieldsByKeys": True,
+            "fields": fields
+        }]
+    }
+    try:
+        r1 = requests.post(url1, json=payload1, headers=headers, timeout=90)
+        if r1.ok:
+            out = r1.json() or {}
+            results = (out.get("results") or [])
+            if not results:
+                # Valid shape but no results object; treat as empty page
+                return {"issues": [], "startAt": start_at, "maxResults": 100, "total": 0}
+            page = results[0] or {}
+            # Normalize shape to legacy for downstream
+            return {
+                "issues": page.get("issues", []),
+                "startAt": page.get("startAt", start_at),
+                "maxResults": page.get("maxResults", 100),
+                "total": page.get("total", 0)
+            }
+        else:
+            print(f"[export] /jql/search failed ({r1.status_code}); trying fallbacks…")
+    except Exception as e:
+        print(f"[export] /jql/search exception: {type(e).__name__}: {e}; trying fallbacks…")
+
+    # Candidate 2: Legacy search
+    url2 = f"{base_url}/rest/api/3/search"
+    payload_legacy = {
         "jql": jql,
         "startAt": start_at,
         "maxResults": 100,
         "fieldsByKeys": True,
-        "fields": fields,
+        "fields": fields
     }
+    try:
+        r2 = requests.post(url2, json=payload_legacy, headers=headers, timeout=90)
+        if r2.ok:
+            return r2.json()
+        else:
+            print(f"[export] /search failed ({r2.status_code}); trying next…")
+    except Exception as e:
+        print(f"[export] /search exception: {type(e).__name__}: {e}; trying next…")
 
-    candidates = [
-        "/rest/api/3/search",        # legacy (most sites support this)
-        "/rest/api/3/issue/search",  # some sites expose this "enhanced" path
-    ]
+    # Candidate 3: Issue search (some sites)
+    url3 = f"{base_url}/rest/api/3/issue/search"
+    try:
+        r3 = requests.post(url3, json=payload_legacy, headers=headers, timeout=90)
+        if r3.ok:
+            return r3.json()
+        else:
+            print(f"[export] /issue/search failed ({r3.status_code}).")
+    except Exception as e:
+        print(f"[export] /issue/search exception: {type(e).__name__}: {e}")
 
-    errors = []
-    for path in candidates:
-        url = f"{base_url}{path}"
-        try:
-            r = requests.post(url, json=payload, headers=headers, timeout=90)
-        except Exception as e:
-            errors.append((path, f"exception {type(e).__name__}: {e}"))
-            continue
-
-        if r.ok:
-            print(f"[export] search OK via {path} (startAt={start_at})")
-            return r.json()
-
-        # Record the failure and try next candidate
-        errors.append((path, f"{r.status_code} {r.text[:300]}"))
-        print(f"[export] {path} failed ({r.status_code}); trying next…")
-
-    # If we reach here, all candidates failed
-    print("Jira search failed on all endpoints:", file=sys.stderr)
-    for p, err in errors:
-        print(f"  - {p}: {err}", file=sys.stderr)
+    print("Jira search failed on all endpoints.", file=sys.stderr)
     sys.exit(1)
 
 def main():
@@ -199,9 +231,15 @@ def main():
 
     rows = []
     start_at = 0
+    total = None
+
     while True:
-        data = jira_search(base_url, auth_b64, jql, start_at, fields)
-        for issue in data.get("issues", []):
+        data = jira_search_any(base_url, auth_b64, jql, start_at, fields)
+        issues = data.get("issues", [])
+        total = data.get("total", total if total is not None else 0)
+        max_results = data.get("maxResults", 100)
+
+        for issue in issues:
             f = issue.get("fields") or {}
             iss_type = (f.get("issuetype") or {}).get("name", "") or ""
             assignee = f.get("assignee") or {}
@@ -223,11 +261,10 @@ def main():
                 reopen_log_val,
             ])
 
-        total = data.get("total", 0)
-        fetched = start_at + data.get("maxResults", 0)
-        if fetched >= total:
+        # pagination
+        start_at += max_results
+        if start_at >= (total or 0):
             break
-        start_at = fetched
 
     with open(args.out, "w", newline="", encoding="utf-8") as fp:
         w = csv.writer(fp)
