@@ -8,19 +8,22 @@ import calendar
 import requests
 
 """
-Exports exact headers (in this order):
+Exports exact headers:
 
   Issue key, Issue Type, Issue id, Summary, Assignee, Assignee Id,
   Custom field (Reopen Count), Custom field (Reopen log )
 
-Resolves customfield IDs by:
-  1) Direct ID env (REOPEN_COUNT_FIELD_ID / REOPEN_LOG_FIELD_ID)
-  2) Display name env (REOPEN_COUNT_FIELD_NAME / REOPEN_LOG_FIELD_NAME)
-  3) Fuzzy match against /rest/api/3/field (case-insensitive, strips bracket suffixes)
+Filters issues by:
+  status CHANGED TO "Reopen" DURING (start, end)
+  AND "Reopen log [Short text]" IS NOT EMPTY
 
-If resolution fails, prints top 'reopen' candidates to help configure names.
+Resolves customfield IDs by display name (with optional override via env).
 
-Also uses enhanced search endpoint first, falls back if needed.
+Env (mapped via workflow):
+  JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN
+  [optional overrides]
+  REOPEN_COUNT_FIELD_ID, REOPEN_LOG_FIELD_ID
+  REOPEN_COUNT_FIELD_NAME, REOPEN_LOG_FIELD_NAME
 """
 
 HEADERS = [
@@ -34,9 +37,9 @@ HEADERS = [
     "Custom field (Reopen log )",
 ]
 
-# Default display names (can be overridden via env)
+# Defaults (can be overridden via env)
 DEFAULT_REOPEN_COUNT_NAME = "Reopen Count"
-DEFAULT_REOPEN_LOG_NAME   = "Reopen log"  # sometimes appears as "Reopen log [Short text]"
+DEFAULT_REOPEN_LOG_NAME   = "Reopen log"
 
 def month_to_range(month: str):
     import re
@@ -71,49 +74,37 @@ def build_field_indexes(fields_json):
     return by_name, by_id
 
 def normalize_name(s: str) -> str:
-    # Lowercase, strip, remove bracket suffix like " [Short text]"
     s = (s or "").strip().lower()
     if "[" in s:
         s = s.split("[", 1)[0].strip()
     return s
 
 def resolve_cf_id(base_url, auth_header, wanted_name, wanted_id=None, all_fields=None):
-    """
-    Return (field_id, debug_info). If wanted_id provided, just validate it exists.
-    """
     fields = all_fields or fetch_all_fields(base_url, auth_header)
     by_name, by_id = build_field_indexes(fields)
 
-    # If ID given, validate and return
     if wanted_id:
         if wanted_id in by_id:
             return wanted_id, f"resolved by explicit ID: {wanted_id}"
-        else:
-            # sometimes Jira returns 'customfield_12345' but site has a different prefix
-            matches = [f for f in by_id.keys() if f.endswith(wanted_id)]
-            if matches:
-                return matches[0], f"resolved by suffix match to ID: {matches[0]}"
-            return None, f"explicit ID '{wanted_id}' not found"
+        matches = [fid for fid in by_id if fid.endswith(wanted_id)]
+        if matches:
+            return matches[0], f"resolved by suffix match ID: {matches[0]}"
+        return None, f"explicit ID '{wanted_id}' not found"
 
-    # Try exact name, fuzzy variants
     norm = normalize_name(wanted_name)
-    # 1) exact (lowercased)
     if norm in by_name:
         return by_name[norm][0]["id"], f"resolved by exact name: '{wanted_name}'"
 
-    # 2) scan for startswith norm
     for key, lst in by_name.items():
         if normalize_name(key) == norm:
             return lst[0]["id"], f"resolved by normalized name: '{wanted_name}' -> '{key}'"
         if key.startswith(norm):
             return lst[0]["id"], f"resolved by prefix match: '{wanted_name}' -> '{key}'"
 
-    # 3) scan for contains norm (last resort)
     for key, lst in by_name.items():
         if norm and norm in key:
             return lst[0]["id"], f"resolved by contains match: '{wanted_name}' -> '{key}'"
 
-    # Not found; return helpful suggestions
     candidates = []
     for f in fields:
         nm = (f.get("name") or "").lower()
@@ -123,6 +114,9 @@ def resolve_cf_id(base_url, auth_header, wanted_name, wanted_id=None, all_fields
     return None, debug
 
 def jira_search(base_url, auth_header, jql, start_at, fields):
+    """
+    Try multiple endpoints. Only fail after all candidates fail.
+    """
     headers = _auth_headers(auth_header)
     payload = {
         "jql": jql,
@@ -131,29 +125,33 @@ def jira_search(base_url, auth_header, jql, start_at, fields):
         "fieldsByKeys": True,
         "fields": fields,
     }
+
     candidates = [
-        "/rest/api/3/issue/search",  # enhanced (some rollouts)
-        "/rest/api/3/search",        # legacy
+        "/rest/api/3/search",        # legacy (most sites support this)
+        "/rest/api/3/issue/search",  # some sites expose this "enhanced" path
     ]
-    last = None
+
+    errors = []
     for path in candidates:
         url = f"{base_url}{path}"
-        r = requests.post(url, json=payload, headers=headers, timeout=90)
-        last = r
-        if r.status_code == 410:
-            print(f"[export] {path} returned 410 GONE; trying next…")
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=90)
+        except Exception as e:
+            errors.append((path, f"exception {type(e).__name__}: {e}"))
             continue
+
         if r.ok:
             print(f"[export] search OK via {path} (startAt={start_at})")
             return r.json()
-        else:
-            # fail fast for non-410 errors to help debugging
-            print(f"Jira search failed via {path}: {r.status_code} {r.text}", file=sys.stderr)
-            sys.exit(1)
-    if last is not None and last.status_code == 410:
-        print("All search endpoints returned 410 GONE. Enhanced search required.", file=sys.stderr)
-    else:
-        print("Jira search failed and no fallback succeeded.", file=sys.stderr)
+
+        # Record the failure and try next candidate
+        errors.append((path, f"{r.status_code} {r.text[:300]}"))
+        print(f"[export] {path} failed ({r.status_code}); trying next…")
+
+    # If we reach here, all candidates failed
+    print("Jira search failed on all endpoints:", file=sys.stderr)
+    for p, err in errors:
+        print(f"  - {p}: {err}", file=sys.stderr)
     sys.exit(1)
 
 def main():
@@ -165,16 +163,15 @@ def main():
     base_url = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
     email    = os.environ.get("JIRA_EMAIL", "")
     token    = os.environ.get("JIRA_API_TOKEN", "")
+    if not base_url or not email or not token:
+        print("Missing JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN", file=sys.stderr)
+        sys.exit(1)
 
-    # Optional overrides:
-    cf_count_id_env = os.environ.get("REOPEN_COUNT_FIELD_ID")      # ex: customfield_12345
+    # Optional overrides from env
+    cf_count_id_env = os.environ.get("REOPEN_COUNT_FIELD_ID")
     cf_log_id_env   = os.environ.get("REOPEN_LOG_FIELD_ID")
     cf_count_name   = os.environ.get("REOPEN_COUNT_FIELD_NAME", DEFAULT_REOPEN_COUNT_NAME)
     cf_log_name     = os.environ.get("REOPEN_LOG_FIELD_NAME",   DEFAULT_REOPEN_LOG_NAME)
-
-    if not base_url or not email or not token:
-        print("Missing JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN env vars.", file=sys.stderr)
-        sys.exit(1)
 
     start, end = month_to_range(args.month)
     jql = (
@@ -184,33 +181,20 @@ def main():
 
     auth_b64 = "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
 
-    # Resolve custom field IDs with robust strategy
+    # Resolve custom field IDs
     all_fields = fetch_all_fields(base_url, auth_b64)
     cf_reopen_count, info1 = resolve_cf_id(base_url, auth_b64, cf_count_name, cf_count_id_env, all_fields=all_fields)
     cf_reopen_log,   info2 = resolve_cf_id(base_url, auth_b64, cf_log_name,   cf_log_id_env,   all_fields=all_fields)
-
     print(f"[export] Reopen Count resolution: {info1}")
     print(f"[export] Reopen Log   resolution: {info2}")
 
     if not cf_reopen_count or not cf_reopen_log:
-        # Help user by listing likely matches
         print("ERROR: Could not resolve custom field IDs for Reopen Count / Reopen log.", file=sys.stderr)
-        print("       You can set either the *names* or the *IDs* via env:", file=sys.stderr)
-        print("         REOPEN_COUNT_FIELD_NAME / REOPEN_LOG_FIELD_NAME", file=sys.stderr)
-        print("         REOPEN_COUNT_FIELD_ID   / REOPEN_LOG_FIELD_ID", file=sys.stderr)
-        # Print candidates with 'reopen' in name:
-        candidates = []
-        for f in all_fields:
-            name = (f.get("name") or "").lower()
-            if "reopen" in name:
-                candidates.append(f"{f.get('id')} :: {f.get('name')}")
-        if candidates:
-            print("       Reopen-like fields found:", file=sys.stderr)
-            for c in candidates:
-                print(f"         - {c}", file=sys.stderr)
+        print("       Configure env overrides via Secrets if needed:", file=sys.stderr)
+        print("       REOPEN_COUNT_FIELD_NAME / REOPEN_LOG_FIELD_NAME or REOPEN_COUNT_FIELD_ID / REOPEN_LOG_FIELD_ID", file=sys.stderr)
         sys.exit(1)
 
-    # Request only required fields (include issuetype for the new column)
+    # Request only fields we need (include issuetype!)
     fields = ["issuetype", "key", "id", "summary", "assignee", cf_reopen_count, cf_reopen_log]
 
     rows = []
