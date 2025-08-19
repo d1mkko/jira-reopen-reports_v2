@@ -17,9 +17,13 @@ Filters issues by:
   status CHANGED TO "Reopen" DURING (start, end)
   AND "Reopen log [Short text]" IS NOT EMPTY
 
-Resolves customfield IDs by display name (with optional override via env).
+Uses the enhanced search endpoint with nextPageToken pagination:
+  1) POST /rest/api/3/search/jql      (primary for your tenant)
+  2) POST /rest/api/3/jql/search      (fallback mirror)
 
-Env (mapped via workflow):
+Resolves customfield IDs by display name, with optional ENV overrides.
+
+ENV (mapped in the workflow):
   JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN
   [optional overrides]
   REOPEN_COUNT_FIELD_ID, REOPEN_LOG_FIELD_ID
@@ -39,7 +43,7 @@ HEADERS = [
 
 # Defaults (can be overridden via env)
 DEFAULT_REOPEN_COUNT_NAME = "Reopen Count"
-DEFAULT_REOPEN_LOG_NAME   = "Reopen log"
+DEFAULT_REOPEN_LOG_NAME   = "Reopen log"  # e.g., UI may show "Reopen log [Short text]"
 
 def month_to_range(month: str):
     import re
@@ -105,6 +109,7 @@ def resolve_cf_id(base_url, auth_header, wanted_name, wanted_id=None, all_fields
         if norm and norm in key:
             return lst[0]["id"], f"resolved by contains match: '{wanted_name}' -> '{key}'"
 
+    # helpful hints in error path
     candidates = []
     for f in fields:
         nm = (f.get("name") or "").lower()
@@ -113,78 +118,78 @@ def resolve_cf_id(base_url, auth_header, wanted_name, wanted_id=None, all_fields
     debug = "not found. Reopen-like fields:\n  - " + "\n  - ".join(candidates) if candidates else "not found. No 'reopen' fields visible."
     return None, debug
 
-def jira_search_any(base_url, auth_header, jql, start_at, fields):
+def search_jql_paginated(base_url, auth_header, jql, fields):
     """
-    Try enhanced batch endpoint first (/jql/search), then legacy ones.
-    Returns a dict with keys: issues, startAt, maxResults, total
+    Try POST /rest/api/3/search/jql first (your tenant supports this),
+    then POST /rest/api/3/jql/search as a fallback.
+
+    Yields issues across pages using nextPageToken / isLast.
     """
     headers = _auth_headers(auth_header)
+    primary = f"{base_url}/rest/api/3/search/jql"
+    fallback = f"{base_url}/rest/api/3/jql/search"
 
-    # Candidate 1: Enhanced JQL batch search
-    # POST /rest/api/3/jql/search
-    # body: { "queries":[ { "jql": "...", "startAt":..., "maxResults":..., "fieldsByKeys": true, "fields":[...] } ] }
-    url1 = f"{base_url}/rest/api/3/jql/search"
-    payload1 = {
-        "queries": [{
-            "jql": jql,
-            "startAt": start_at,
-            "maxResults": 100,
-            "fieldsByKeys": True,
-            "fields": fields
-        }]
-    }
-    try:
-        r1 = requests.post(url1, json=payload1, headers=headers, timeout=90)
-        if r1.ok:
-            out = r1.json() or {}
-            results = (out.get("results") or [])
-            if not results:
-                # Valid shape but no results object; treat as empty page
-                return {"issues": [], "startAt": start_at, "maxResults": 100, "total": 0}
-            page = results[0] or {}
-            # Normalize shape to legacy for downstream
-            return {
-                "issues": page.get("issues", []),
-                "startAt": page.get("startAt", start_at),
-                "maxResults": page.get("maxResults", 100),
-                "total": page.get("total", 0)
+    def _pager(url):
+        next_token = None
+        while True:
+            body = {
+                "jql": jql,
+                "maxResults": 100,
+                "fields": fields
             }
-        else:
-            print(f"[export] /jql/search failed ({r1.status_code}); trying fallbacks…")
-    except Exception as e:
-        print(f"[export] /jql/search exception: {type(e).__name__}: {e}; trying fallbacks…")
+            if next_token:
+                body["nextPageToken"] = next_token
 
-    # Candidate 2: Legacy search
-    url2 = f"{base_url}/rest/api/3/search"
-    payload_legacy = {
-        "jql": jql,
-        "startAt": start_at,
-        "maxResults": 100,
-        "fieldsByKeys": True,
-        "fields": fields
-    }
+            r = requests.post(url, json=body, headers=headers, timeout=90)
+            if not r.ok:
+                return None, f"{r.status_code} {r.text[:300]}"
+            data = r.json() or {}
+            issues = data.get("issues", [])
+            for it in issues:
+                yield it
+            is_last = data.get("isLast", True)
+            if is_last:
+                return True, None
+            next_token = data.get("nextPageToken")
+            if not next_token:
+                return True, None
+
+    # Primary
+    print("[export] trying /rest/api/3/search/jql")
+    done, err = None, None
+    gen = _pager(primary)
     try:
-        r2 = requests.post(url2, json=payload_legacy, headers=headers, timeout=90)
-        if r2.ok:
-            return r2.json()
-        else:
-            print(f"[export] /search failed ({r2.status_code}); trying next…")
+        for issue in gen:
+            yield issue
+        done, err = gen  # try to read completion info
+    except TypeError:
+        # generator finished; assume success
+        done = True
     except Exception as e:
-        print(f"[export] /search exception: {type(e).__name__}: {e}; trying next…")
+        err = f"exception {type(e).__name__}: {e}"
 
-    # Candidate 3: Issue search (some sites)
-    url3 = f"{base_url}/rest/api/3/issue/search"
+    if done:
+        print("[export] search OK via /rest/api/3/search/jql")
+        return
+
+    print(f"[export] /search/jql failed; {err or 'unknown error'}, trying /jql/search…")
+
+    # Fallback
+    done, err = None, None
+    gen = _pager(fallback)
     try:
-        r3 = requests.post(url3, json=payload_legacy, headers=headers, timeout=90)
-        if r3.ok:
-            return r3.json()
-        else:
-            print(f"[export] /issue/search failed ({r3.status_code}).")
+        for issue in gen:
+            yield issue
+        done, err = gen
+    except TypeError:
+        done = True
     except Exception as e:
-        print(f"[export] /issue/search exception: {type(e).__name__}: {e}")
+        err = f"exception {type(e).__name__}: {e}"
 
-    print("Jira search failed on all endpoints.", file=sys.stderr)
-    sys.exit(1)
+    if not done:
+        print(f"Jira search failed on both /search/jql and /jql/search. {err or ''}", file=sys.stderr)
+        sys.exit(1)
+    print("[export] search OK via /rest/api/3/jql/search")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -199,7 +204,7 @@ def main():
         print("Missing JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN", file=sys.stderr)
         sys.exit(1)
 
-    # Optional overrides from env
+    # Optional overrides
     cf_count_id_env = os.environ.get("REOPEN_COUNT_FIELD_ID")
     cf_log_id_env   = os.environ.get("REOPEN_LOG_FIELD_ID")
     cf_count_name   = os.environ.get("REOPEN_COUNT_FIELD_NAME", DEFAULT_REOPEN_COUNT_NAME)
@@ -226,45 +231,31 @@ def main():
         print("       REOPEN_COUNT_FIELD_NAME / REOPEN_LOG_FIELD_NAME or REOPEN_COUNT_FIELD_ID / REOPEN_LOG_FIELD_ID", file=sys.stderr)
         sys.exit(1)
 
-    # Request only fields we need (include issuetype!)
+    # Fields to request (include issuetype!)
     fields = ["issuetype", "key", "id", "summary", "assignee", cf_reopen_count, cf_reopen_log]
 
     rows = []
-    start_at = 0
-    total = None
+    for issue in search_jql_paginated(base_url, auth_b64, jql, fields):
+        f = issue.get("fields") or {}
+        iss_type = (f.get("issuetype") or {}).get("name", "") or ""
+        assignee = f.get("assignee") or {}
+        assignee_name = assignee.get("displayName", "") or ""
+        assignee_id   = assignee.get("accountId", "") or ""
+        reopen_count_val = f.get(cf_reopen_count, "")
+        reopen_log_val   = f.get(cf_reopen_log, "")
+        if reopen_log_val is None: reopen_log_val = ""
+        if isinstance(reopen_log_val, list): reopen_log_val = "; ".join(map(str, reopen_log_val))
 
-    while True:
-        data = jira_search_any(base_url, auth_b64, jql, start_at, fields)
-        issues = data.get("issues", [])
-        total = data.get("total", total if total is not None else 0)
-        max_results = data.get("maxResults", 100)
-
-        for issue in issues:
-            f = issue.get("fields") or {}
-            iss_type = (f.get("issuetype") or {}).get("name", "") or ""
-            assignee = f.get("assignee") or {}
-            assignee_name = assignee.get("displayName", "") or ""
-            assignee_id   = assignee.get("accountId", "") or ""
-            reopen_count_val = f.get(cf_reopen_count, "")
-            reopen_log_val   = f.get(cf_reopen_log, "")
-            if reopen_log_val is None: reopen_log_val = ""
-            if isinstance(reopen_log_val, list): reopen_log_val = "; ".join(map(str, reopen_log_val))
-
-            rows.append([
-                issue.get("key", ""),
-                iss_type,
-                issue.get("id", ""),
-                f.get("summary", "") or "",
-                assignee_name,
-                assignee_id,
-                "" if reopen_count_val is None else reopen_count_val,
-                reopen_log_val,
-            ])
-
-        # pagination
-        start_at += max_results
-        if start_at >= (total or 0):
-            break
+        rows.append([
+            issue.get("key", ""),
+            iss_type,
+            issue.get("id", ""),
+            f.get("summary", "") or "",
+            assignee_name,
+            assignee_id,
+            "" if reopen_count_val is None else reopen_count_val,
+            reopen_log_val,
+        ])
 
     with open(args.out, "w", newline="", encoding="utf-8") as fp:
         w = csv.writer(fp)
