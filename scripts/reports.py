@@ -11,7 +11,7 @@ def _extract_reopen_events(row):
       (Issue key, Issue Type, Summary, Assignee, Date)
     """
     issue_key  = row.get('Issue key', '')
-    issue_type = row.get('Issue Type', '')  # <-- now taken from export.csv
+    issue_type = row.get('Issue Type', '')  # carried from export.csv
     summary    = row.get('Summary', '')
     text       = str(row.get('Custom field (Reopen log )', '') or '')
 
@@ -26,12 +26,21 @@ def _extract_reopen_events(row):
         events.append((issue_key, issue_type, summary, assignee_name, date_str))
     return events
 
+def _issue_key_to_project(issue_key: str) -> str:
+    """
+    Extract project key from an Issue key like 'ABC-123'. Returns '' if not parseable.
+    """
+    if not isinstance(issue_key, str):
+        return ''
+    i = issue_key.find('-')
+    return issue_key[:i] if i > 0 else ''
+
 def process(input_csv_path, out_user_csv_path, out_ticket_csv_path):
     """
     Reads export.csv, filters by env MONTH (YYYY-MM),
     writes:
-      - reopens_by_user.csv (Assignee, Reopens Count)
-      - reopens_by_ticket.csv (Issue key, Issue Type, Summary, Reopens Count, Assignee)
+      - reopens_by_user.csv    (Project, Assignee, Reopens Count)  sorted by Project, then Assignee
+      - reopens_by_ticket.csv  (Issue key, Issue Type, Summary, Reopens Count, Assignee)
     """
     month = os.environ.get("MONTH", "").strip()
     if not month or not re.match(r'^\d{4}-\d{2}$', month):
@@ -52,31 +61,34 @@ def process(input_csv_path, out_user_csv_path, out_ticket_csv_path):
 
     # No events? write empty CSVs with headers and return
     if not all_events:
-        pd.DataFrame(columns=['Assignee', 'Reopens Count']).to_csv(out_user_csv_path, index=False)
+        pd.DataFrame(columns=['Project', 'Assignee', 'Reopens Count']).to_csv(out_user_csv_path, index=False)
         pd.DataFrame(columns=['Issue key','Issue Type','Summary','Reopens Count','Assignee']).to_csv(out_ticket_csv_path, index=False)
         return
 
     events_df = pd.DataFrame(all_events, columns=['Issue key','Issue Type','Summary','Assignee','Date'])
     events_df['Date'] = pd.to_datetime(events_df['Date'], errors='coerce')
     events_df['Month'] = events_df['Date'].dt.to_period('M').astype(str)
-    events_df = events_df[events_df['Month'] == month]
+    events_df = events_df[events_df['Month'] == month].copy()
 
-    # --- By user ---
+    # Derive Project from Issue key (prefix before '-')
+    events_df['Project'] = events_df['Issue key'].apply(_issue_key_to_project)
+
+    # --- Reopens by user: include Project, order by Project then Assignee ---
     by_user = (
-        events_df.groupby('Assignee')
+        events_df
+        .groupby(['Project', 'Assignee'])
         .size().reset_index(name='Reopens Count')
-        .sort_values('Reopens Count', ascending=False)
+        .sort_values(['Project', 'Assignee'], ascending=[True, True])
     )
     by_user.to_csv(out_user_csv_path, index=False)
 
-    # --- By ticket (with Issue Type) ---
+    # --- Reopens by ticket (with Issue Type), sorted by Assignee then Issue key ---
     by_ticket = (
         events_df
         .groupby(['Issue key', 'Issue Type', 'Summary', 'Assignee'])
-        .size().reset_index(name='Reopens Count')
-        # sort primarily by Assignee (A→Z), then Issue key
+        .size()
+        .reset_index(name='Reopens Count')
         .sort_values(['Assignee', 'Issue key'], ascending=[True, True])
     )
-    # Column order exactly as requested
     by_ticket = by_ticket[['Issue key', 'Issue Type', 'Summary', 'Reopens Count', 'Assignee']]
     by_ticket.to_csv(out_ticket_csv_path, index=False)
